@@ -1,10 +1,8 @@
-"""
-Usage:
-    python run_flow2_execution.py \
-        --input path/to/source.jsonl \
-        --output path/to/results.jsonl \
-        --endpoint http://localhost:8083/sparql
-"""
+# Usage:
+#     python step2_execute.py \
+#         --input path/to/source.jsonl \
+#         --output path/to/results.jsonl \
+#         --endpoint http://localhost:8083/sparql
 
 import argparse
 import json
@@ -15,6 +13,7 @@ from pathlib import Path
 import requests
 
 
+# Per-run JSONL keys: (label, query key, cosine key). Must match step1's
 RUN_FIELDS = [
     ("run1", "sparql_run1", "cosine_sim_run1"),
     ("run2", "sparql_run2", "cosine_sim_run2"),
@@ -23,20 +22,24 @@ RUN_FIELDS = [
 
 QUERY_TIMEOUT = 30    # per-query timeout in seconds
 
+# Choose the run with the highest cosine sim among a row's 3 runs.
 def pick_best_run(row: dict):
     best = None
     for label, sparql_key, cos_key in RUN_FIELDS:
         sparql_text = row.get(sparql_key)
         cos_val = row.get(cos_key)
+        # skip empty/non-string queries and runs that were never scored
         if not sparql_text or not isinstance(sparql_text, str) or not sparql_text.strip():
             continue
         if cos_val is None:
             continue
+        # Keep the run with the highest cosine sim (best[2] is the current max cos_val).
         if best is None or cos_val > best[2]:
             best = (label, sparql_text, cos_val)
     return best if best else (None, None, None)
 
 
+# Execute one SPARQL query against the endpoint.
 def run_sparql_query(endpoint: str, query: str, timeout: int):
     result = {
         "success": False,
@@ -50,6 +53,7 @@ def run_sparql_query(endpoint: str, query: str, timeout: int):
     headers = {"Accept": "application/sparql-results+json"}
     params = {"query": query}
 
+    # Network-level failure (connection refused, timeout, ...).
     try:
         resp = requests.get(endpoint, params=params, headers=headers, timeout=timeout)
     except requests.exceptions.RequestException as e:
@@ -58,16 +62,19 @@ def run_sparql_query(endpoint: str, query: str, timeout: int):
 
     result["http_status"] = resp.status_code
 
+    # Non-200 usually means a malformed/invalid query rejected by Ontop.
     if resp.status_code != 200:
         result["error"] = f"http_{resp.status_code}: {resp.text[:500]}"
         return result
 
+    # 200 but body isn't valid JSON.
     try:
         data = resp.json()
     except ValueError as e:
         result["error"] = f"json_decode_error: {e} | body: {resp.text[:500]}"
         return result
 
+    # JSON parsed but not the expected SPARQL-results shape.
     try:
         columns = data.get("head", {}).get("vars", [])
         bindings = data.get("results", {}).get("bindings", [])
@@ -75,6 +82,7 @@ def run_sparql_query(endpoint: str, query: str, timeout: int):
         result["error"] = f"unexpected_response_shape: {e}"
         return result
 
+    # Flatten each binding {var: {type, value}} down to {var: value}.
     rows = []
     for b in bindings:
         row_dict = {var: b[var].get("value") for var in b}
@@ -88,6 +96,7 @@ def run_sparql_query(endpoint: str, query: str, timeout: int):
 
 
 def main():
+    # For each row in the flow-1 JSONL, pick its best-cosine run and execute
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", required=True, help="Path to source eval jsonl file")
     ap.add_argument("--output", required=True, help="Path to write new jsonl results")
@@ -124,6 +133,7 @@ def main():
 
             run_label, sparql_text, cosine_sim = pick_best_run(row)
 
+            # No usable query for this row record as skipped, don't hit the endpoint.
             if sparql_text is None:
                 skipped += 1
                 out_record = {
@@ -147,6 +157,7 @@ def main():
                 print_progress(total, ok, failed, skipped, elapsed)
                 continue
 
+            # Execute the chosen query and tally it as ok (ran) or failed (errored).
             exec_result = run_sparql_query(args.endpoint, sparql_text, QUERY_TIMEOUT)
 
             if exec_result["success"]:
@@ -172,6 +183,7 @@ def main():
             print_progress(total, ok, failed, skipped, elapsed)
 
     elapsed = time.time() - t0
+    # Empty input file: nothing was processed, skip the summary.
     if total == 0:
         print(f"No rows found in {in_path}.", file=sys.stderr)
         return

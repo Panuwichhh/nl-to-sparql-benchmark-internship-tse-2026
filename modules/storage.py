@@ -1,6 +1,4 @@
-"""
-DFSL exemplar bank (retrieval pool).
-"""
+# DFSL exemplar bank (retrieval pool).
 
 storage = [
     {

@@ -91,11 +91,13 @@ OUTPUT_JSONL = f"results/eval/sparql_eval_results_{_TS}.jsonl"
 
 
 # OLLAMA HEALTH CHECK
+# Return True only if the Ollama server is up AND `model` is pulled.
 def check_ollama(model: str, base_url: str) -> bool:
     host = base_url.replace("/v1", "")
     try:
         with urllib.request.urlopen(f"{host}/api/tags", timeout=5) as r:
             data = json.loads(r.read())
+        # Names of models currently pulled on the Ollama server.
         available = [m["name"] for m in data.get("models", [])]
     except urllib.error.URLError as e:
         print(f"[Ollama] [ERROR]  Server not responding at {host}  ({e.reason})")
@@ -113,13 +115,15 @@ def check_ollama(model: str, base_url: str) -> bool:
     return True
 
 # SCORING
+# Cosine similarity of two vectors; 0.0 if either has zero magnitude.
 def cosine_sim(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
     denom = np.linalg.norm(vec_a) * np.linalg.norm(vec_b)
     return float(np.dot(vec_a, vec_b) / denom) if denom else 0.0
 
-#compute mean cosine similarity between label and predictions
+# Embed the gold label + each prediction and score them by cosine similarity.
 def compute_scores(embed_model: SentenceTransformer, label: str, predictions: list[str]) -> dict:
     vecs = embed_model.encode([label] + predictions, convert_to_numpy=True)
+    # vecs[0] is the label; predictions start at vecs[1], hence the i+1 offset.
     sims = [cosine_sim(vecs[0], vecs[i + 1]) for i in range(len(predictions))]
     mean = float(np.mean(sims))
     return {
@@ -131,6 +135,7 @@ def compute_scores(embed_model: SentenceTransformer, label: str, predictions: li
 
 
 # LLM CALL
+# Send one chat completion, retrying transient failures with backoff.
 def call_llm(backend: dict, messages: list[dict], retries: int = 3) -> str:
     extra_body = {"options": {"num_ctx": backend["num_ctx"]}} if backend.get("num_ctx") else {}
     for attempt in range(1, retries + 1):
@@ -146,6 +151,8 @@ def call_llm(backend: dict, messages: list[dict], retries: int = 3) -> str:
         except KeyboardInterrupt:
             raise
         except Exception as e:
+            # Out of retries: return the error as a string (don't raise) so the
+            # eval loop keeps going and the failure is recorded in the row.
             if attempt == retries:
                 return f"ERROR: {e}"
             wait = 2 ** attempt
@@ -156,6 +163,7 @@ def call_llm(backend: dict, messages: list[dict], retries: int = 3) -> str:
 
 
 # JSONL EXPORT
+# Write rows to `path` as JSONL atomically (write to .part, then rename).
 def export_jsonl(rows: list[dict], path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = path + ".part"
@@ -164,7 +172,6 @@ def export_jsonl(rows: list[dict], path: str) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     os.replace(tmp_path, path)
 
-# checkpoint - save progress
 def checkpoint_jsonl(rows: list[dict], path: str, tag: str = "") -> None:
     if not rows:
         return
@@ -185,6 +192,7 @@ def _build_row(
     latencies: list[float],
     scores: dict | None,
 ) -> dict:
+    # Flatten one (model, style, question)'s RUNS results into a single JSONL row.
     row: dict = {
         "model":        backend["label"],
         "id":           q["id"],
@@ -203,7 +211,10 @@ def _build_row(
         row[f"cosine_sim_run{i}"] = scores["sims"][i - 1] if scores else ""
     return row
 
+# Run every backend x style x question x RUNS, scoring each response by
+# cosine similarity to the gold label.
 def run_evaluation():
+    # Fail fast: verify every Ollama backend is ready before doing any work.
     for backend in BACKENDS:
         if backend["provider"] == "ollama":
             if not check_ollama(backend["model"], backend.get("base_url", _ollama_url)):
@@ -213,10 +224,12 @@ def run_evaluation():
     embed_model = SentenceTransformer(EMBED_MODEL_NAME, trust_remote_code=True)
     print("Embedding model ready.\n")
 
+    # Prepare per-style retrievers
     retrievers: dict[str, object] = {}
-    # for DFSL prompt style - load storage
+    # Only touch storage if some DFSL-family style is present
     if any(s.startswith("DFSL") for s in PROMPT_STYLES):
         _dfsl_items, _dfsl_emb = load_storage()
+        # Register the retriever for the exact "DFSL" style
         if "DFSL" in PROMPT_STYLES:
             retrievers["DFSL"] = lambda q: retrieve(q, _dfsl_items, _dfsl_emb, k=5)
             print(f"DFSL storage loaded: {len(_dfsl_items)} examples")
@@ -233,6 +246,7 @@ def run_evaluation():
     print(f"Styles: {len(PROMPT_STYLES)}  |  Questions: {len(QUESTIONS)}  |  Total calls: {total}")
     print(f"{'='*60}\n")
 
+    # Nested sweep: every model x prompt style x question x RUNS repetitions.
     for backend in BACKENDS:
         print(f"{'─'*60}\n>>  Backend: {backend['label']}\n{'─'*60}")
         backend_start = time.perf_counter()
@@ -241,6 +255,7 @@ def run_evaluation():
             print(f"  Prompt Style: {style}")
 
             for q in QUESTIONS:
+                # Repeat each question RUNS times.
                 results, latencies = [], []
                 for run in range(1, RUNS + 1):
                     messages = build_prompt(style, q["question"], retriever=retrievers.get(style))
@@ -253,7 +268,9 @@ def run_evaluation():
                     print(f"     Q{q['id']:02d} Run{run} [{done}/{total}] done  ({elapsed:.2f}s)")
                     time.sleep(SLEEP_SEC)
 
+                # Score against the gold label
                 label  = q.get("sparql_label", "")
+                # Clean each raw run into a bare query; unparsable output.
                 pred_queries = [extract_sparql(r) or "" for r in results]
                 scores = compute_scores(embed_model, label, pred_queries) if label.strip() else None
                 rows.append(_build_row(backend, q, style, results, latencies, scores))
